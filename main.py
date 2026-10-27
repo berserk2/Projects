@@ -1,1 +1,0 @@
-print("Telemetry service started")
