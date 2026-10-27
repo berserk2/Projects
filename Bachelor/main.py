@@ -426,6 +426,12 @@ class SpectrumAnalyzerDriver:
     def __init__(self, resource):
         self.dev = resource
         self.dev.timeout = 10000
+        # Очищаем только статусные регистры/буфер ошибок (не сбрасывая частоты и настройки)
+        try:
+            self.dev.write('*cls')
+            time.sleep(0.05)
+        except Exception:
+            pass
 
     def safe_write(self, cmd: str):
         try:
@@ -435,29 +441,35 @@ class SpectrumAnalyzerDriver:
             raise RuntimeError(f"Сбой записи в DSA [{cmd}]: {str(e)}")
 
     def safe_query(self, cmd: str) -> str:
+        """Безопасный запрос с паузой между записью и чтением (раздельные write/read)."""
         try:
-            res = self.dev.query(cmd)
-            time.sleep(0.1)
-            return res.strip()
+            self.dev.write(cmd)
+            time.sleep(0.15)
+            res = self.dev.read().strip()
+            return res
         except Exception as e:
             raise RuntimeError(f"Сбой запроса к DSA [{cmd}]: {str(e)}")
 
     def apply_settings(self, center_freq: float, span: float, rbw: float, vbw: Optional[float] = None):
         if vbw is None:
             vbw = rbw
-        self.safe_write(f':SENS:FREQ:CENT {center_freq}')
-        self.safe_write(f':SENS:FREQ:SPAN {span}')
-        self.safe_write(f':SENS:BAND:RES {rbw}')
-        self.safe_write(f':SENS:BAND:VIDEO {vbw}')
+        self.safe_write(f':sens:freq:cent {center_freq}')
+        self.safe_write(f':sens:freq:span {span}')
+        self.safe_write(f':sens:band:res {rbw}')
+        self.safe_write(f':sens:band:video {vbw}')
 
     def find_peak(self) -> Tuple[float, float]:
-        self.safe_write(':CALC:MARK1:STAT ON')
-        self.safe_write(':CALC:MARK1:MAX')
+        self.safe_write(':calc:mark1:stat on')
+        self.safe_write(':calc:mark1:max')
         time.sleep(0.3)
-        try: peak_freq = float(self.safe_query(':CALC:MARK1:X?'))
-        except Exception: peak_freq = 0.0
-        try: peak_amp = float(self.safe_query(':CALC:MARK1:Y?'))
-        except Exception: peak_amp = 0.0
+        try:
+            peak_freq = float(self.safe_query(':calc:mark1:x?'))
+        except Exception:
+            peak_freq = 0.0
+        try:
+            peak_amp = float(self.safe_query(':calc:mark1:y?'))
+        except Exception:
+            peak_amp = 0.0
         return peak_freq, peak_amp
 
     def save_state_json(self, folder_path: str, step: int, mode_name: str = "manual"):
@@ -476,14 +488,30 @@ class SpectrumAnalyzerDriver:
             "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S")
         }
 
-        try: settings["center_freq_hz"] = float(self.safe_query(':SENS:FREQ:CENT?'))
+        # Безопасный последовательный опрос в нижнем регистре
+        try: settings["center_freq_hz"] = float(self.safe_query(':sens:freq:cent?'))
         except Exception: settings["center_freq_hz"] = 0.0
-        try: settings["span_hz"] = float(self.safe_query(':SENS:FREQ:SPAN?'))
+
+        try: settings["span_hz"] = float(self.safe_query(':sens:freq:span?'))
         except Exception: settings["span_hz"] = 0.0
-        try: settings["rbw_hz"] = float(self.safe_query(':SENS:BAND:RES?'))
+
+        try: settings["start_freq_hz"] = float(self.safe_query(':sens:freq:start?'))
+        except Exception: settings["start_freq_hz"] = 0.0
+
+        try: settings["stop_freq_hz"] = float(self.safe_query(':sens:freq:stop?'))
+        except Exception: settings["stop_freq_hz"] = 0.0
+
+        try: settings["rbw_hz"] = float(self.safe_query(':sens:band:res?'))
         except Exception: settings["rbw_hz"] = 0.0
-        try: settings["vbw_hz"] = float(self.safe_query(':SENS:BAND:VIDEO?'))
+
+        try: settings["vbw_hz"] = float(self.safe_query(':sens:band:video?'))
         except Exception: settings["vbw_hz"] = 0.0
+
+        try: settings["sweep_time_s"] = float(self.safe_query(':sens:sweep:time?'))
+        except Exception: settings["sweep_time_s"] = 0.0
+
+        try: settings["input_attenuation_db"] = float(self.safe_query(':sens:pow:att?'))
+        except Exception: settings["input_attenuation_db"] = 0.0
 
         json_file = os.path.join(settings_folder, filename)
         with open(json_file, 'w', encoding='utf-8') as f:
@@ -494,22 +522,35 @@ class SpectrumAnalyzerDriver:
             settings = json.load(f)
 
         if "center_freq_hz" in settings:
-            self.safe_write(f':SENS:FREQ:CENT {settings["center_freq_hz"]}')
+            self.safe_write(f':sens:freq:cent {settings["center_freq_hz"]}')
         if "span_hz" in settings:
-            self.safe_write(f':SENS:FREQ:SPAN {settings["span_hz"]}')
+            self.safe_write(f':sens:freq:span {settings["span_hz"]}')
         if "rbw_hz" in settings:
-            self.safe_write(f':SENS:BAND:RES {settings["rbw_hz"]}')
+            self.safe_write(f':sens:band:res {settings["rbw_hz"]}')
         if "vbw_hz" in settings:
-            self.safe_write(f':SENS:BAND:VIDEO {settings["vbw_hz"]}')
+            self.safe_write(f':sens:band:video {settings["vbw_hz"]}')
 
     def save_trace_csv(self, traces_folder: str, step: int, voltage: float, gen_freq: float = 0):
         try:
-            self.safe_write(':INIT:CONT OFF')
-            self.safe_write(':INIT:IMM')
-            time.sleep(2.0)
+            # 1. Считываем фактическое время развертки, чтобы подождать завершения
+            try:
+                sweep_time = float(self.safe_query(':sens:sweep:time?'))
+            except Exception:
+                sweep_time = 1.0
 
-            self.safe_write(':FORM ASCII')
-            raw_response = self.safe_query(':TRACE:DATA? TRACE1')
+            # 2. Остановка непрерывного режима и запуск однократного прохода
+            self.safe_write(':init:cont off')
+            time.sleep(0.1)
+            self.safe_write(':init:imm')
+
+            # Ждем полное время развертки + запас на обработку
+            time.sleep(max(sweep_time + 0.3, 1.5))
+
+            # 3. Запрос данных трассы (через write + read)
+            self.safe_write(':form ascii')
+            self.dev.write(':trace:data? trace1')
+            time.sleep(0.3)
+            raw_response = self.dev.read().strip()
 
             if raw_response.startswith('#'):
                 comma_pos = raw_response.find(',')
@@ -524,8 +565,10 @@ class SpectrumAnalyzerDriver:
             for v in data_part.split(','):
                 v = v.strip()
                 if v:
-                    try: amps.append(float(v))
-                    except ValueError: continue
+                    try:
+                        amps.append(float(v))
+                    except ValueError:
+                        continue
 
             if not amps:
                 raise RuntimeError("Пустая трасса спектроанализатора.")
@@ -533,10 +576,12 @@ class SpectrumAnalyzerDriver:
             amps_array = np.array(amps)
             num_points = len(amps_array)
 
-            start_freq_hz = float(self.safe_query(':SENS:FREQ:START?'))
-            stop_freq_hz = float(self.safe_query(':SENS:FREQ:STOP?'))
+            # 4. Читаем диапазон частот для построения оси X
+            start_freq_hz = float(self.safe_query(':sens:freq:start?'))
+            stop_freq_hz = float(self.safe_query(':sens:freq:stop?'))
             freqs_mhz = np.linspace(start_freq_hz / 1e6, stop_freq_hz / 1e6, num_points)
 
+            # 5. Сохранение файла
             os.makedirs(traces_folder, exist_ok=True)
             voltage_str = f"{voltage:.2f}".replace('.', '_')
             if gen_freq > 0:
@@ -548,11 +593,15 @@ class SpectrumAnalyzerDriver:
             df = pd.DataFrame({'Frequency_MHz': freqs_mhz, 'Amplitude_dBm': amps_array})
             df.to_csv(filepath, index=False, sep=';', decimal=',', encoding='utf-8-sig')
 
-            self.safe_write(':INIT:CONT ON')
+            # 6. Возвращаем анализатор в непрерывный режим работы
+            self.safe_write(':init:cont on')
             return freqs_mhz, amps_array
+
         except Exception as e:
-            try: self.safe_write(':INIT:CONT ON')
-            except Exception: pass
+            try:
+                self.safe_write(':init:cont on')
+            except Exception:
+                pass
             raise RuntimeError(f"Сбой сохранения трассы анализатора: {str(e)}")
 
     def close(self):
@@ -560,7 +609,6 @@ class SpectrumAnalyzerDriver:
             self.dev.close()
         except Exception:
             pass
-
 
 # ==============================================================================
 # АППАРАТНЫЙ ДРАЙВЕР ИЗМЕРИТЕЛЯ МОЩНОСТИ (PM100USB)
